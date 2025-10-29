@@ -1,189 +1,267 @@
 #!/usr/bin/env python3
 """
-scan_net.py
-Escanea la red local y lista dispositivos (IP, MAC, Vendor, Hostname).
-Uso:
-  sudo python3 scan_net.py 192.168.18.0/24
-Si no pasás rango, intenta detectar la red local desde hostname -I.
-"""
+rpi_menu_toolbox.py
+Menú interactivo seguro para pruebas controladas en tu red local.
 
-import subprocess, sys, csv, re, shutil, socket, time
+Opciones incluidas (seguras):
+  1) Scanear RED (usa arp-scan / nmap si están instalados)
+  2) Monitorizar un host (ping periódico y log)
+  3) Capturar tráfico (tcpdump -> pcap) para análisis
+  4) Mostrar resultados CSV del último escaneo
+  5) (PLACEHOLDER) Atacar tal usuario -> NO ejecuta ataque; solo registra intención
+  6) Salir
+
+Nota: ejecutar con sudo para que nmap/arp-scan/tcpdump funcione correctamente:
+  sudo ./rpi_menu_toolbox.py
+"""
+import os
+import sys
+import subprocess
+import shutil
+import time
+import csv
 from datetime import datetime
 
-def run(cmd, shell=False):
+SCAN_CSV = "scan_results.csv"
+PING_LOG = "ping_log.csv"
+INTENTION_LOG = "intencion_de_ataque.log"
+PCAP_FILE = "capture.pcap"
+
+def clear():
+    os.system("clear" if os.name != "nt" else "cls")
+
+def run(cmd, capture=True, shell=False):
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, shell=shell)
-        return out
-    except subprocess.CalledProcessError as e:
-        return e.output
-    except FileNotFoundError:
-        return None
+        if capture:
+            res = subprocess.run(cmd if isinstance(cmd, list) else cmd, shell=shell,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return res.returncode, (res.stdout or "").strip()
+        else:
+            res = subprocess.run(cmd if isinstance(cmd, list) else cmd, shell=shell)
+            return res.returncode, ""
+    except FileNotFoundError as e:
+        return 127, str(e)
 
-def detect_local_network():
-    out = run(["hostname", "-I"])
-    if out:
-        ips = out.strip().split()
-        if ips:
-            ip = ips[0]
-            parts = ip.split(".")
+# ---------------- SCAN ----------------
+def scan_network_auto(target=None):
+    """
+    Intenta usar arp-scan, sino nmap, sino arp -a, y guarda resultados en CSV simple.
+    """
+    if not target:
+        # intentar detectar automáticamente
+        rc, ipout = run(["hostname", "-I"])
+        if rc == 0 and ipout.strip():
+            ip = ipout.strip().split()[0]
+            parts = ip.split('.')
             if len(parts) == 4:
-                return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
-    # fallback common ranges
-    return "192.168.1.0/24"
+                target = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    if not target:
+        target = input("Ingresá la red CIDR a escanear (ej. 192.168.18.0/24): ").strip()
+        if not target:
+            print("Cancelado.")
+            return
 
-def parse_arp_scan(output):
-    # arp-scan lines: IP<TAB>MAC<TAB>VENDOR
     devices = []
-    if not output:
-        return devices
-    for line in output.splitlines():
-        line = line.strip()
-        m = re.match(r"^([\d\.]+)\s+([0-9a-f:]{17})\s+(.+)$", line, re.I)
-        if m:
-            devices.append({"ip": m.group(1), "mac": m.group(2).lower(), "vendor": m.group(3).strip(), "host": ""})
-    return devices
+    print(f"[+] Scan objetivo: {target}")
 
-def parse_nmap_grepable(output):
-    devices = []
-    if not output:
-        return devices
-    # Nmap -sn -oG format: Host: 192.168.18.45 ()   Status: Up
-    # and later "MAC: xx:xx:xx (Vendor)"
-    current = {}
-    for line in output.splitlines():
-        if line.startswith("Host:"):
-            parts = line.split()
-            ip = parts[1]
-            current = {"ip": ip, "mac": "", "vendor": "", "host": ""}
-            devices.append(current)
-        elif "MAC Address:" in line or "MAC:" in line:
-            m = re.search(r"MAC (?:Address:)?\s*([0-9A-Fa-f:]{17})\s*\(?([^\)]*)\)?", line)
-            if m and current:
-                current["mac"] = m.group(1).lower()
-                current["vendor"] = m.group(2).strip()
-        elif "Nmap scan report for" in line:
-            m = re.search(r"Nmap scan report for (.+?) \(([\d\.]+)\)", line)
-            if m:
-                name = m.group(1).strip()
-                ip = m.group(2).strip()
-                for d in devices:
-                    if d["ip"] == ip:
-                        d["host"] = name
-    return devices
+    # 1) arp-scan
+    if shutil.which("arp-scan"):
+        print("[*] Ejecutando arp-scan --localnet (requiere sudo)...")
+        rc, out = run(["sudo", "arp-scan", "--localnet"])
+        if rc == 0 and out:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and is_ip(parts[0]) and is_mac(parts[1]):
+                    devices.append({"ip": parts[0], "mac": parts[1].lower(), "vendor": " ".join(parts[2:]), "host": ""})
+    # 2) nmap fallback / complemento
+    if shutil.which("nmap"):
+        print("[*] Ejecutando nmap -sn para completar información...")
+        rc, out = run(["sudo", "nmap", "-sn", target, "-oG", "-"])
+        if rc == 0 and out:
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("Host:"):
+                    # Host: 192.168.18.45 ()    Status: Up
+                    parts = line.split()
+                    ip = parts[1] if len(parts) > 1 else ""
+                    if is_ip(ip):
+                        # añadir si no está
+                        if not any(d["ip"] == ip for d in devices):
+                            devices.append({"ip": ip, "mac": "", "vendor": "", "host": ""})
+                if "MAC Address:" in line or "MAC:" in line:
+                    import re
+                    m = re.search(r"([0-9A-Fa-f:]{17})\s*\(?([^\)]*)\)?", line)
+                    if m:
+                        mac = m.group(1).lower()
+                        vendor = m.group(2).strip()
+                        # buscar dispositivo por IP cercano (último añadido)
+                        for d in reversed(devices):
+                            if d.get("mac") == "" or d.get("vendor") == "":
+                                d["mac"] = mac
+                                d["vendor"] = vendor
+                                break
 
-def parse_arp_a(output):
-    devices = []
-    if not output:
-        return devices
-    # lines like: ? (192.168.18.1) at a4:7c:c9:08:c0:ad [ether] on wlp2s0
-    for line in output.splitlines():
-        m = re.search(r"\(([\d\.]+)\)\s+at\s+([0-9a-f:]{17})\s+\[", line, re.I)
-        if m:
-            ip = m.group(1)
-            mac = m.group(2).lower()
-            devices.append({"ip": ip, "mac": mac, "vendor": "", "host": ""})
-    return devices
+    # 3) arp -a fallback
+    if not devices:
+        print("[*] Usando arp -a (fallback)...")
+        rc, out = run(["arp", "-a"])
+        if rc == 0 and out:
+            import re
+            for line in out.splitlines():
+                m = re.search(r"\(([\d\.]+)\)\s+at\s+([0-9a-f:]{17})", line, re.I)
+                if m:
+                    devices.append({"ip": m.group(1), "mac": m.group(2).lower(), "vendor": "", "host": ""})
 
-def ping_sweep(range_cidr):
-    # range like 192.168.18.0/24 -> generate ips .1 to .254
-    base = ".".join(range_cidr.split(".")[:3])
-    devices = []
-    for i in range(1,255):
-        ip = f"{base}.{i}"
-        p = subprocess.run(["ping","-c","1","-W","1",ip], stdout=subprocess.DEVNULL)
-        if p.returncode == 0:
-            devices.append({"ip": ip, "mac": "", "vendor": "", "host": ""})
-    return devices
+    # guardar CSV
+    if devices:
+        save_csv(devices, SCAN_CSV)
+        print(f"[+] Scan finalizado. {len(devices)} dispositivos guardados en {SCAN_CSV}")
+    else:
+        print("[-] No se detectaron dispositivos o no hay herramientas instaladas (arp-scan/nmap).")
 
-def uniq_devices(devs):
-    seen = {}
-    out = []
-    for d in devs:
-        ip = d.get("ip")
-        if ip not in seen:
-            seen[ip] = True
-            out.append(d)
-    return out
+def is_ip(s):
+    parts = s.split('.')
+    return len(parts) == 4 and all(p.isdigit() and 0<=int(p)<=255 for p in parts)
 
-def mac_lookup_oui(mac):
-    # fast OUI lookup using local cache file (optional). If no cache/online, return empty.
-    # For simplicity, return empty here. User can integrate IEEE oui lookup if wants.
-    return ""
+def is_mac(s):
+    import re
+    return bool(re.match(r"^[0-9a-f:]{17}$", s.lower()))
 
-def save_csv(devices, fname="scan_results.csv"):
+def save_csv(devices, fname):
+    fieldnames = ["ip","mac","vendor","host"]
     with open(fname, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["ip","mac","vendor","host"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for d in devices:
             writer.writerow({"ip": d.get("ip",""), "mac": d.get("mac",""), "vendor": d.get("vendor",""), "host": d.get("host","")})
-    print(f"Saved {len(devices)} devices to {fname}")
 
-def main():
-    target = sys.argv[1] if len(sys.argv) > 1 else detect_local_network()
-    print(f"[+] Target network: {target}")
-    devices = []
+# ---------------- PING MONITOR ----------------
+def monitor_ping(target=None, interval=2):
+    if not target:
+        target = input("IP objetivo para monitor (ej. 192.168.18.161): ").strip()
+        if not target:
+            print("Cancelado.")
+            return
+    print(f"Monitoreando {target}. Ctrl+C para detener. Guardando en {PING_LOG}")
+    with open(PING_LOG, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp","target","reachable","rtt_ms"])
+        try:
+            while True:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rc, out = run(["ping", "-c", "1", "-W", "1", target])
+                reachable = rc == 0
+                rtt = ""
+                if reachable:
+                    import re
+                    m = re.search(r"time=([\d\.]+) ms", out)
+                    if m:
+                        rtt = m.group(1)
+                writer.writerow([ts, target, "UP" if reachable else "DOWN", rtt])
+                f.flush()
+                print(ts, target, "UP" if reachable else "DOWN", rtt)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nInterrumpido por usuario. Saliendo monitor.")
 
-    # 1) try arp-scan
-    if shutil.which("arp-scan"):
-        print("[*] Running arp-scan (requires sudo)...")
-        out = run(["sudo","arp-scan","--localnet"])
-        devices = parse_arp_scan(out)
+# ---------------- TCPDUMP CAPTURE ----------------
+def capture_traffic(interface=None, duration=None):
+    if not shutil.which("tcpdump"):
+        print("tcpdump no instalado. Instalar: sudo apt install tcpdump")
+        return
+    if not interface:
+        interface = input("Interfaz a usar para captura (ej. wlan0mon o wlan0): ").strip()
+        if not interface:
+            print("Cancelado.")
+            return
+    cmd = ["sudo", "tcpdump", "-i", interface, "-w", PCAP_FILE]
+    if duration:
+        print(f"Capturando en {interface} por {duration} segundos -> {PCAP_FILE}")
+        try:
+            p = subprocess.Popen(cmd)
+            time.sleep(duration)
+            p.terminate()
+            print(f"Captura guardada en {PCAP_FILE}")
+        except KeyboardInterrupt:
+            p.terminate()
+            print("Captura interrumpida, archivo guardado.")
     else:
-        print("[-] arp-scan not found")
+        print(f"Iniciando captura en {interface}. Ctrl+C para detener. Archivo: {PCAP_FILE}")
+        try:
+            subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print("\nCaptura interrumpida por usuario.")
 
-    # 2) if none or partial, try nmap -sn
-    if (not devices) and shutil.which("nmap"):
-        print("[*] Running nmap ping-scan (requires sudo)...")
-        out = run(["sudo","nmap","-sn", target, "-oG","-"])
-        devices = parse_nmap_grepable(out)
-    elif (shutil.which("nmap") and devices):
-        # try complement nmap to enrich data
-        print("[*] Enriching with nmap...")
-        out = run(["sudo","nmap","-sn", target, "-oG","-"])
-        more = parse_nmap_grepable(out)
-        # merge by IP, prefer mac/vendor if present
-        ips = {d["ip"]: d for d in devices}
-        for m in more:
-            ip = m["ip"]
-            if ip in ips:
-                if not ips[ip].get("mac") and m.get("mac"):
-                    ips[ip]["mac"] = m["mac"]
-                    ips[ip]["vendor"] = m.get("vendor","")
-                if not ips[ip].get("host") and m.get("host"):
-                    ips[ip]["host"] = m.get("host")
-            else:
-                ips[ip] = m
-        devices = list(ips.values())
+# ---------------- SHOW CSV ----------------
+def show_last_csv():
+    if not os.path.exists(SCAN_CSV):
+        print("No hay archivo de scan. Ejecutá primero 'Scanear RED'.")
+        return
+    print(f"Mostrando {SCAN_CSV}:")
+    with open(SCAN_CSV, newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            print(f"{r['ip']:<16} {r['mac']:<20} {r['vendor']:<30} {r['host']}")
 
-    # 3) fallback to arp -a
-    if (not devices):
-        print("[*] Trying arp -a ...")
-        out = run(["arp","-a"])
-        devices = parse_arp_a(out)
+# ---------------- PLACEHOLDER "ATACAR" (NO EXECUTA ATAQUES) ----------------
+def placeholder_attack():
+    print("\n*** AVISO IMPORTANTE ***")
+    print("Esta opción es SOLO un placeholder. No ejecutará ningún ataque.")
+    print("Si deseas llevar a cabo pruebas de desconexión en tu red, usa métodos legales")
+    print("como cambiar la contraseña del AP, desactivar temporalmente el SSID o usar un AP de prueba.")
+    print("El script registrará tu intención en un log para que puedas completarlo por fuera.")
+    target = input("IP/MAC objetivo (para el registro): ").strip()
+    reason = input("Breve motivo/nota: ").strip()
+    ts = datetime.now().isoformat()
+    with open(INTENTION_LOG, "a") as f:
+        f.write(f"{ts} | target={target} | note={reason}\n")
+    print(f"Intención registrada en {INTENTION_LOG}. No se ejecutó ninguna acción.")
 
-    # 4) final fallback ping sweep (slow)
-    if (not devices):
-        print("[*] Falling back to ping sweep (slow)...")
-        devices = ping_sweep(target)
-
-    devices = uniq_devices(devices)
-
-    # try reverse DNS for hostnames if empty
-    for d in devices:
-        if not d.get("host"):
+# ---------------- MENÚ ----------------
+def menu():
+    while True:
+        print("\n=== RPi SAFE TOOLBOX ===")
+        print("1) Scanear RED (arp-scan / nmap / arp -a)")
+        print("2) Monitorizar host (ping log)")
+        print("3) Capturar tráfico (tcpdump -> pcap)")
+        print("4) Mostrar últimos resultados (CSV)")
+        print("5) (PLACEHOLDER) Atacar tal usuario (NO ejecuta ataque)")
+        print("6) Salir")
+        choice = input("Elegí una opción [1-6]: ").strip()
+        clear()
+        if choice == "1":
+            network = input("Red CIDR (enter para autodetectar): ").strip() or None
+            scan_network_auto(network)
+        elif choice == "2":
+            target = input("IP objetivo (enter para preguntar después): ").strip() or None
+            interval = input("Intervalo entre pings (segundos, default 2): ").strip()
             try:
-                d["host"] = socket.gethostbyaddr(d["ip"])[0]
-            except Exception:
-                d["host"] = ""
-
-    # print nicely
-    print("\nFound devices:")
-    print(f"{'IP':<16} {'MAC':<20} {'VENDOR':<30} {'HOST'}")
-    for d in devices:
-        print(f"{d.get('ip',''):<16} {d.get('mac',''):<20} {d.get('vendor',''):<30} {d.get('host','')}")
-
-    # save csv
-    save_csv(devices)
+                interval = int(interval) if interval else 2
+            except:
+                interval = 2
+            monitor_ping(target, interval)
+        elif choice == "3":
+            interface = input("Interfaz para captura (enter para preguntar): ").strip() or None
+            dur = input("Duración en segundos (enter para captura hasta Ctrl+C): ").strip()
+            try:
+                dur = int(dur) if dur else None
+            except:
+                dur = None
+            capture_traffic(interface, dur)
+        elif choice == "4":
+            show_last_csv()
+        elif choice == "5":
+            placeholder_attack()
+        elif choice == "6":
+            print("Saliendo. Buenas pruebas controladas.")
+            break
+        else:
+            print("Opción inválida.")
 
 if __name__ == "__main__":
-    main()
+    if os.geteuid() != 0:
+        print("Nota: ejecutar como root (sudo) puede ser necesario para nmap/arp-scan/tcpdump.")
+    try:
+        menu()
+    except KeyboardInterrupt:
+        print("\nInterrumpido por usuario. Saliendo.")
