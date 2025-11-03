@@ -214,6 +214,9 @@ def menu():
             if choice == '2':
                 manager_monitor.disable_monitor_mode()
 
+            run(f"sudo iwconfig")
+
+
         elif choice == "6":
             print("Saliendo. Buenas pruebas controladas.")
             break
