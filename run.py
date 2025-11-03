@@ -1,19 +1,5 @@
-#!/usr/bin/env python3
-"""
-rpi_menu_toolbox.py
-Menú interactivo seguro para pruebas controladas en tu red local.
 
-Opciones incluidas (seguras):
-  1) Scanear RED (usa arp-scan / nmap si están instalados)
-  2) Monitorizar un host (ping periódico y log)
-  3) Capturar tráfico (tcpdump -> pcap) para análisis
-  4) Mostrar resultados CSV del último escaneo
-  5) (PLACEHOLDER) Atacar tal usuario -> NO ejecuta ataque; solo registra intención
-  6) Salir
 
-Nota: ejecutar con sudo para que nmap/arp-scan/tcpdump funcione correctamente:
-  sudo ./rpi_menu_toolbox.py
-"""
 import os
 import sys
 import subprocess
@@ -21,15 +7,60 @@ import shutil
 import time
 import csv
 from datetime import datetime
+from monitor import MonitorManager
 
-SCAN_CSV = "scan_results.csv"
-PING_LOG = "ping_log.csv"
-INTENTION_LOG = "intencion_de_ataque.log"
 PCAP_FILE = "capture.pcap"
+
+# ---------------- PARCEAR IP Y MAC ----------------
+def is_ip(s):
+    parts = s.split('.')
+    return len(parts) == 4 and all(p.isdigit() and 0<=int(p)<=255 for p in parts)
+
+def is_mac(s):
+    import re
+    return bool(re.match(r"^[0-9a-f:]{17}$", s.lower()))
+
+# ---------------- GUARDA LA INFORMACION EN UN CSV ----------------
+def save_csv(devices, fname):
+    fieldnames = ["ip","mac","vendor","host"]
+    with open(fname, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for d in devices:
+            writer.writerow({"ip": d.get("ip",""), "mac": d.get("mac",""), "vendor": d.get("vendor",""), "host": d.get("host","")})
+
+
+
+# ---------------- PING MONITOR ----------------
+def monitor_ping(target=None, interval=2):
+    if not target:
+        target = input("IP objetivo para monitor (ej. 192.168.18.161): ").strip()
+        if not target:
+            print("Cancelado.")
+            return
+    print(f"Monitoreando {target}. Ctrl+C para detener.")
+   
+    try:
+        while True:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rc, out = run(["ping", "-c", "1", "-W", "1", target])
+            reachable = rc == 0
+            rtt = ""
+            if reachable:
+                import re
+                m = re.search(r"time=([\d\.]+) ms", out)
+                if m:
+                    rtt = m.group(1)
+            print(ts, target, "UP" if reachable else "DOWN", rtt)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nInterrumpido por usuario. Saliendo monitor.")
 
 def clear():
     os.system("clear" if os.name != "nt" else "cls")
+# ---------------- MENÚ ----------------
 
+# ---------------- RUN CMD TODOS LOS COMANDOS VAN POR ACA ----------------
 def run(cmd, capture=True, shell=False):
     try:
         if capture:
@@ -41,6 +72,7 @@ def run(cmd, capture=True, shell=False):
             return res.returncode, ""
     except FileNotFoundError as e:
         return 127, str(e)
+
 
 # ---------------- SCAN ----------------
 def scan_network_auto(target=None):
@@ -102,67 +134,7 @@ def scan_network_auto(target=None):
                                 break
 
     # 3) arp -a fallback
-    if not devices:
-        print("[*] Usando arp -a (fallback)...")
-        rc, out = run(["arp", "-a"])
-        if rc == 0 and out:
-            import re
-            for line in out.splitlines():
-                m = re.search(r"\(([\d\.]+)\)\s+at\s+([0-9a-f:]{17})", line, re.I)
-                if m:
-                    devices.append({"ip": m.group(1), "mac": m.group(2).lower(), "vendor": "", "host": ""})
 
-    # guardar CSV
-    if devices:
-        save_csv(devices, SCAN_CSV)
-        print(f"[+] Scan finalizado. {len(devices)} dispositivos guardados en {SCAN_CSV}")
-    else:
-        print("[-] No se detectaron dispositivos o no hay herramientas instaladas (arp-scan/nmap).")
-
-def is_ip(s):
-    parts = s.split('.')
-    return len(parts) == 4 and all(p.isdigit() and 0<=int(p)<=255 for p in parts)
-
-def is_mac(s):
-    import re
-    return bool(re.match(r"^[0-9a-f:]{17}$", s.lower()))
-
-def save_csv(devices, fname):
-    fieldnames = ["ip","mac","vendor","host"]
-    with open(fname, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for d in devices:
-            writer.writerow({"ip": d.get("ip",""), "mac": d.get("mac",""), "vendor": d.get("vendor",""), "host": d.get("host","")})
-
-# ---------------- PING MONITOR ----------------
-def monitor_ping(target=None, interval=2):
-    if not target:
-        target = input("IP objetivo para monitor (ej. 192.168.18.161): ").strip()
-        if not target:
-            print("Cancelado.")
-            return
-    print(f"Monitoreando {target}. Ctrl+C para detener. Guardando en {PING_LOG}")
-    with open(PING_LOG, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp","target","reachable","rtt_ms"])
-        try:
-            while True:
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                rc, out = run(["ping", "-c", "1", "-W", "1", target])
-                reachable = rc == 0
-                rtt = ""
-                if reachable:
-                    import re
-                    m = re.search(r"time=([\d\.]+) ms", out)
-                    if m:
-                        rtt = m.group(1)
-                writer.writerow([ts, target, "UP" if reachable else "DOWN", rtt])
-                f.flush()
-                print(ts, target, "UP" if reachable else "DOWN", rtt)
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nInterrumpido por usuario. Saliendo monitor.")
 
 # ---------------- TCPDUMP CAPTURE ----------------
 def capture_traffic(interface=None, duration=None):
@@ -192,42 +164,22 @@ def capture_traffic(interface=None, duration=None):
         except KeyboardInterrupt:
             print("\nCaptura interrumpida por usuario.")
 
-# ---------------- SHOW CSV ----------------
-def show_last_csv():
-    if not os.path.exists(SCAN_CSV):
-        print("No hay archivo de scan. Ejecutá primero 'Scanear RED'.")
-        return
-    print(f"Mostrando {SCAN_CSV}:")
-    with open(SCAN_CSV, newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            print(f"{r['ip']:<16} {r['mac']:<20} {r['vendor']:<30} {r['host']}")
-
-# ---------------- PLACEHOLDER "ATACAR" (NO EXECUTA ATAQUES) ----------------
 def placeholder_attack():
-    print("\n*** AVISO IMPORTANTE ***")
-    print("Esta opción es SOLO un placeholder. No ejecutará ningún ataque.")
-    print("Si deseas llevar a cabo pruebas de desconexión en tu red, usa métodos legales")
-    print("como cambiar la contraseña del AP, desactivar temporalmente el SSID o usar un AP de prueba.")
-    print("El script registrará tu intención en un log para que puedas completarlo por fuera.")
-    target = input("IP/MAC objetivo (para el registro): ").strip()
-    reason = input("Breve motivo/nota: ").strip()
-    ts = datetime.now().isoformat()
-    with open(INTENTION_LOG, "a") as f:
-        f.write(f"{ts} | target={target} | note={reason}\n")
-    print(f"Intención registrada en {INTENTION_LOG}. No se ejecutó ninguna acción.")
+    print("ATACANDO")
 
-# ---------------- MENÚ ----------------
 def menu():
     while True:
+        
         print("\n=== RPi SAFE TOOLBOX ===")
         print("1) Scanear RED (arp-scan / nmap / arp -a)")
         print("2) Monitorizar host (ping log)")
         print("3) Capturar tráfico (tcpdump -> pcap)")
-        print("4) Mostrar últimos resultados (CSV)")
-        print("5) (PLACEHOLDER) Atacar tal usuario (NO ejecuta ataque)")
+        print("4) (PLACEHOLDER) Atacar tal usuario (NO ejecuta ataque)")
+        print("5) Placa de red Monitor")
         print("6) Salir")
+
         choice = input("Elegí una opción [1-6]: ").strip()
+
         clear()
         if choice == "1":
             network = input("Red CIDR (enter para autodetectar): ").strip() or None
@@ -248,20 +200,26 @@ def menu():
             except:
                 dur = None
             capture_traffic(interface, dur)
-        elif choice == "4":
-            show_last_csv()
+
         elif choice == "5":
-            placeholder_attack()
+            interface = input("Introduce la interfaz (ej: wlan0): ").strip()
+            manager_monitor = MonitorManager(interface)
+            print("1) Activar el modo monitor")
+            print("2) Desactivar el modo monitor")
+
+            choice = input("Elegí una opción [1-2]: ").strip()
+
+            if choice == '1':
+                manager_monitor.enable_monitor_mode()
+            if choice == '2':
+                manager_monitor.disable_monitor_mode()
+
         elif choice == "6":
             print("Saliendo. Buenas pruebas controladas.")
             break
         else:
             print("Opción inválida.")
 
+
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print("Nota: ejecutar como root (sudo) puede ser necesario para nmap/arp-scan/tcpdump.")
-    try:
-        menu()
-    except KeyboardInterrupt:
-        print("\nInterrumpido por usuario. Saliendo.")
+    menu()
