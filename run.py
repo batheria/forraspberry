@@ -8,8 +8,8 @@ import time
 import csv
 from datetime import datetime
 from monitor import MonitorManager
-import re
-from shutil import which
+import moduls
+from wireless import Wireless
 
 PCAP_FILE = "capture.pcap"
 
@@ -33,6 +33,7 @@ def save_csv(devices, fname):
 
 
 
+
 # ---------------- PING MONITOR ----------------
 def monitor_ping(target=None, interval=2):
     if not target:
@@ -45,7 +46,7 @@ def monitor_ping(target=None, interval=2):
     try:
         while True:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rc, out = run(["ping", "-c", "1", "-W", "1", target])
+            rc, out = moduls.run(["ping", "-c", "1", "-W", "1", target])
             reachable = rc == 0
             rtt = ""
             if reachable:
@@ -60,160 +61,8 @@ def monitor_ping(target=None, interval=2):
 
 def clear():
     os.system("clear" if os.name != "nt" else "cls")
-# ---------------- MENÚ ----------------
-
-# ---------------- RUN CMD TODOS LOS COMANDOS VAN POR ACA ----------------
-def run(cmd, capture=True, shell=False):
-    try:
-        if capture:
-            res = subprocess.run(cmd if isinstance(cmd, list) else cmd, shell=shell,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            return res.returncode, (res.stdout or "").strip()
-        else:
-            res = subprocess.run(cmd if isinstance(cmd, list) else cmd, shell=shell)
-            return res.returncode, ""
-    except FileNotFoundError as e:
-        return 127, str(e)
 
 
-# ---------------- SCAN WIRELESS ----------------
-
-def parse_iwlist_scan(output):
-    """Parsea la salida de `iwlist <iface> scan`."""
-    networks = []
-    # split by 'Cell'
-    cells = re.split(r"\n\s*Cell\s+\d+\s+-\s+Address:\s+", output)
-    for cell in cells[1:]:
-        net = {"raw": cell.strip(), "ssid": None, "bssid": None, "channel": None, "signal_dbm": None, "encryption": "OPEN"}
-        # BSSID
-        m = re.match(r"([0-9A-Fa-f:]{17})", cell)
-        if m:
-            net["bssid"] = m.group(1).lower()
-
-        ess = re.search(r'ESSID:"(.*)"', cell)
-        if ess:
-            net["ssid"] = ess.group(1) or "<hidden>"
-
-        ch = re.search(r"Channel:(\d+)", cell)
-        if ch:
-            net["channel"] = int(ch.group(1))
-        else:
-            freq = re.search(r"Frequency:(\d+\.\d+)", cell)
-            if freq:
-                # not converting freq to channel here
-                net["channel"] = freq.group(1)
-
-        sig = re.search(r"Signal level[=\-: ]+([-0-9]+) dBm", cell)
-        if not sig:
-            sig = re.search(r"Quality=.*Signal level[=\-: ]*([-0-9]+) dBm", cell)
-        if sig:
-            try:
-                net["signal_dbm"] = int(sig.group(1))
-            except:
-                net["signal_dbm"] = sig.group(1)
-
-        enc_on = re.search(r"Encryption key:(on|off)", cell)
-        if enc_on and enc_on.group(1) == "on":
-            # look for WPA/RSN
-            if re.search(r"WPA2|WPA|RSN", cell, re.IGNORECASE):
-                net["encryption"] = "WPA/WPA2"
-            else:
-                net["encryption"] = "Encrypted"
-        else:
-            net["encryption"] = "OPEN"
-
-        networks.append(net)
-    return networks
-
-def detect_wireless_interface():
-    """Detecta la primera interfaz wireless usando `iw dev` o lista /sys/class/net."""
-    try:
-        out = subprocess.run(["iw", "dev"], capture_output=True, text=True)
-        if out.returncode == 0:
-            m = re.search(r"Interface\s+(\w+)", out.stdout)
-            if m:
-                return m.group(1)
-    except FileNotFoundError:
-        pass
-
-    # Fallback: buscar interfaces en /sys/class/net que tengan /wireless
-    import os
-    for iface in os.listdir("/sys/class/net"):
-        if os.path.exists(f"/sys/class/net/{iface}/wireless"):
-            return iface
-    return None
-
-def parse_iw_scan(output):
-    """Parsea la salida de `iw dev <iface> scan`."""
-    networks = []
-    # Split entries by "BSS " which starts each block
-    blocks = re.split(r"\nBSS\s+", "\n" + output)
-    for block in blocks[1:]:
-        net = {"raw": block.strip(), "ssid": None, "bssid": None, "channel": None, "signal_dbm": None, "encryption": "OPEN"}
-        # BSSID is first token on the block (MAC)
-        m = re.match(r"([0-9a-fA-F:]{17})", block)
-        if m:
-            net["bssid"] = m.group(1).lower()
-
-        ssid = re.search(r"\n\s*SSID:\s*(.*)\n", block)
-        if ssid:
-            net["ssid"] = ssid.group(1).strip() or "<hidden>"
-
-        sig = re.search(r"signal:\s*([-0-9.]+)\s*dBm", block)
-        if sig:
-            try:
-                net["signal_dbm"] = int(float(sig.group(1)))
-            except:
-                net["signal_dbm"] = sig.group(1)
-
-        ch = re.search(r"DS Parameter set: channel (\d+)", block)
-        if ch:
-            net["channel"] = int(ch.group(1))
-        else:
-            ch2 = re.search(r"freq:\s*(\d+)", block)  # freq in MHz
-            if ch2:
-                freq = int(ch2.group(1))
-                # convert common 2.4GHz channels; basic conversion:
-                if 2412 <= freq <= 2472:
-                    net["channel"] = (freq - 2407) // 5
-                elif freq == 2484:
-                    net["channel"] = 14
-                else:
-                    net["channel"] = freq
-
-        # encryption detection
-        if re.search(r"\n\s*RSN:\s*", block) or "WPA" in block or re.search(r"IE:\s*WPA", block):
-            net["encryption"] = "WPA/WPA2"
-        elif re.search(r"privacy", block, re.IGNORECASE) or re.search(r"cipher", block, re.IGNORECASE):
-            net["encryption"] = "Encrypted"
-        else:
-            net["encryption"] = "OPEN"
-
-        networks.append(net)
-    return networks
-
-def scan_networks(interface=None):
-    """Detecta interfaz (si no se pasa) y escanea redes retornando una lista de dicts."""
-    if interface is None:
-        interface = detect_wireless_interface()
-        if interface is None:
-            raise RuntimeError("No se detectó interfaz inalámbrica. Conecta un adaptador y prueba de nuevo.")
-
-    # Preferir 'iw' si existe
-    if which("iw"):
-        cmd = ["sudo", "iw", "dev", interface, "scan"]
-        rc, out = run(cmd)
-        if rc == 0 and out.strip():
-            return parse_iw_scan(out)
-        # si falla, no panic: intentar iwlist
-    # Fallback a iwlist
-    if which("iwlist"):
-        cmd = ["sudo", "iwlist", interface, "scan"]
-        rc, out = run(cmd)
-        if rc == 0 and out.strip():
-            return parse_iwlist_scan(out)
-
-    raise RuntimeError("No se pudo ejecutar scan. Asegúrate de tener 'iw' o 'iwlist' instalado y ejecutar con permisos (sudo).")
 
 #------------------- SCAN PUERTOS --------------------------------
 
@@ -223,7 +72,7 @@ def scan_network_auto(target=None):
     """
     if not target:
         # intentar detectar automáticamente
-        rc, ipout = run(["hostname", "-I"])
+        rc, ipout = moduls.run(["hostname", "-I"])
         if rc == 0 and ipout.strip():
             ip = ipout.strip().split()[0]
             parts = ip.split('.')
@@ -241,7 +90,7 @@ def scan_network_auto(target=None):
     # 1) arp-scan
     if shutil.which("arp-scan"):
         print("[*] Ejecutando arp-scan --localnet (requiere sudo)...")
-        rc, out = run(["sudo", "arp-scan", "--localnet"])
+        rc, out = moduls.run(["sudo", "arp-scan", "--localnet"])
         if rc == 0 and out:
             for line in out.splitlines():
                 parts = line.split()
@@ -250,7 +99,7 @@ def scan_network_auto(target=None):
     # 2) nmap fallback / complemento
     if shutil.which("nmap"):
         print("[*] Ejecutando nmap -sn para completar información...")
-        rc, out = run(["sudo", "nmap", "-sn", target, "-oG", "-"])
+        rc, out = moduls.run(["sudo", "nmap", "-sn", target, "-oG", "-"])
         if rc == 0 and out:
             for line in out.splitlines():
                 line = line.strip()
@@ -309,6 +158,10 @@ def capture_traffic(interface=None, duration=None):
 def placeholder_attack():
     print("ATACANDO")
 
+# ---------------- MENÚ ----------------
+
+
+
 def menu():
     while True:
         
@@ -327,7 +180,9 @@ def menu():
             iface = None
             if len(sys.argv) > 1:
                 iface = sys.argv[1]
-            nets = scan_networks(iface)
+
+                nets = Wireless.main()
+
             if not nets:
                 print("No se encontraron redes.")
             else:
@@ -376,7 +231,7 @@ def menu():
             if choice == '2':
                 manager_monitor.disable_monitor_mode()
 
-            run(f"sudo iwconfig")
+            moduls.run(f"sudo iwconfig")
 
 
         elif choice == "6":
