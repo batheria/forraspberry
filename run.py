@@ -8,10 +8,13 @@ import time
 import csv
 from datetime import datetime
 from monitor import MonitorManager
-import moduls
+from moduls import Commands
 from wireless import Wireless
 
 PCAP_FILE = "capture.pcap"
+
+comands = Commands()
+
 
 # ---------------- PARCEAR IP Y MAC ----------------
 def is_ip(s):
@@ -46,7 +49,7 @@ def monitor_ping(target=None, interval=2):
     try:
         while True:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rc, out = moduls.run(["ping", "-c", "1", "-W", "1", target])
+            rc, out = comands.run(["ping", "-c", "1", "-W", "1", target])
             reachable = rc == 0
             rtt = ""
             if reachable:
@@ -72,7 +75,7 @@ def scan_network_auto(target=None):
     """
     if not target:
         # intentar detectar automáticamente
-        rc, ipout = moduls.run(["hostname", "-I"])
+        rc, ipout = comands.run(["hostname", "-I"])
         if rc == 0 and ipout.strip():
             ip = ipout.strip().split()[0]
             parts = ip.split('.')
@@ -90,7 +93,7 @@ def scan_network_auto(target=None):
     # 1) arp-scan
     if shutil.which("arp-scan"):
         print("[*] Ejecutando arp-scan --localnet (requiere sudo)...")
-        rc, out = moduls.run(["sudo", "arp-scan", "--localnet"])
+        rc, out = comands.run(["sudo", "arp-scan", "--localnet"])
         if rc == 0 and out:
             for line in out.splitlines():
                 parts = line.split()
@@ -99,7 +102,7 @@ def scan_network_auto(target=None):
     # 2) nmap fallback / complemento
     if shutil.which("nmap"):
         print("[*] Ejecutando nmap -sn para completar información...")
-        rc, out = moduls.run(["sudo", "nmap", "-sn", target, "-oG", "-"])
+        rc, out = comands.run(["sudo", "nmap", "-sn", target, "-oG", "-"])
         if rc == 0 and out:
             for line in out.splitlines():
                 line = line.strip()
@@ -231,7 +234,7 @@ def menu():
             if choice == '2':
                 manager_monitor.disable_monitor_mode()
 
-            moduls.run(f"sudo iwconfig")
+            comands.run(f"sudo iwconfig")
 
 
         elif choice == "6":
